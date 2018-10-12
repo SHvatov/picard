@@ -28,9 +28,12 @@ import htsjdk.samtools.util.Log;
 import htsjdk.samtools.util.ProgressLogger;
 import picard.sam.util.PhysicalLocation;
 import picard.sam.util.ReadNameParser;
+import picard.util.GraphUtils;
 
 import java.io.Serializable;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Contains methods for finding optical/co-localized/sequencing duplicates.
@@ -150,12 +153,20 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
             progressLoggerForRest = null;
         }
 
-        // First go through and compare all the reads to the keeper
-        if (actualKeeper != null) {
-            for (int i = 0; i < length; ++i) {
-                final PhysicalLocation other = list.get(i);
-                opticalDuplicateFlags[i] = closeEnough(actualKeeper, other, distance);
-
+        // Make a graph where the edges are reads that lie within the optical duplicate pixel distance from each other,
+        // we will then use the union-find algorithm to cluster the graph and find optical duplicate groups
+        final GraphUtils.Graph<Integer> opticalDistanceRelationGraph = new GraphUtils.Graph<>();
+        if (logProgress) {
+            log.debug("Building adjacency graph for duplicate group");
+        }
+        int keeperIndex = -1;
+        for (int i = 0; i < length; i++) {
+            final PhysicalLocation thisLoc = list.get(i);
+            if (keeper == thisLoc) {
+                keeperIndex = i;
+            }
+            for (int j = i + 1; j < length; j++) {
+                PhysicalLocation other = list.get(j);
                 // The main point of adding this log and if statement (also below) is a workaround a bug in the JVM
                 // which causes a deep exception (https://github.com/broadinstitute/picard/issues/472).
                 // It seems that this is related to https://bugs.openjdk.java.net/browse/JDK-8033717 which
@@ -164,33 +175,53 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
                 // and this loop seemed to kill the JVM for some reason. This logging statement (and the one in the
                 // loop below) solved the problem.
                 if (logProgress) progressLoggerForKeeper.record(String.format("%d", other.getReadGroup()), other.getX());
-            }
-        }
-        if (logProgress) log.debug("Done with comparing to keeper, now the rest.");
-
-        // Now go through and do each pairwise comparison not involving the actualKeeper
-        for (int i = 0; i < length; ++i) {
-            final PhysicalLocation lhs = list.get(i);
-            if (lhs == actualKeeper) continue; // no comparisons to actualKeeper since those are all handled above
-
-            // logging here for same reason as above
-            if (logProgress) progressLoggerForRest.record(String.format("%d", lhs.getReadGroup()), lhs.getX());
-
-            for (int j = i + 1; j < length; ++j) {
-                final PhysicalLocation rhs = list.get(j);
-                if (rhs == actualKeeper) continue; // no comparisons to actualKeeper since those are all handled above
-                if (opticalDuplicateFlags[i] && opticalDuplicateFlags[j]) continue; // both already marked, no need to check
-
-                if (closeEnough(lhs, rhs, distance)) {
-                    // At this point we want to mark either lhs or rhs as duplicate. Either could have been marked
-                    // as a duplicate of the keeper (but not both - that's checked above), so be careful about which
-                    // one to now mark as a duplicate.
-                    final int index = opticalDuplicateFlags[j] ? i : j;
-                    opticalDuplicateFlags[index] = true;
+                if (closeEnough(thisLoc, other, distance)) {
+                    opticalDistanceRelationGraph.addEdge(i, j);
                 }
             }
         }
+        if (logProgress) {
+            log.debug("Finished building adjacency graph for duplicate group, moving onto clustering");
+        }
 
+        // Keep a map of the reads and their cluster assignments
+        final Map<Integer, Integer> opticalDuplicateClusterMap = opticalDistanceRelationGraph.cluster();
+        final Map<Integer, Integer> clusterToRepresentativeRead = new HashMap<>();
+        Integer keeperCluster = null;
+
+        // Specially mark the keeper as specifically not a duplicate if it exists
+        if (keeperIndex >= 0) {
+            clusterToRepresentativeRead.put(opticalDuplicateClusterMap.get(keeperIndex), keeperIndex);
+            keeperCluster = opticalDuplicateClusterMap.get(keeperIndex);
+        }
+
+        for (final Map.Entry<Integer, Integer> entry : opticalDuplicateClusterMap.entrySet()) {
+            // logging here for same reason as above
+            final int recordIndex = entry.getKey();
+            final int recordAssignedCluster = entry.getValue();
+            if (logProgress) {
+                progressLoggerForRest.record(String.format("%d", list.get(recordIndex).getReadGroup()), list.get(recordIndex).getX());
+            }
+
+            // If its not the first read we've seen for this cluster, mark it as an optical duplicate
+            if (clusterToRepresentativeRead.containsKey(recordAssignedCluster) && recordIndex != keeperIndex) {
+                final PhysicalLocation representativeLoc = list.get(clusterToRepresentativeRead.get(recordAssignedCluster));
+                final PhysicalLocation currentRecordLoc = list.get(recordIndex);
+
+                // If not in the keeper cluster, then keep the minX -> minY valued duplicate (note the tile must be equal for reads to cluster together)
+                if (!(keeperCluster != null && recordAssignedCluster == keeperCluster) && // checking we don't accidentally set the keeper as an optical duplicate
+                        (currentRecordLoc.getX() < representativeLoc.getX() || (currentRecordLoc.getX() == representativeLoc.getX() && currentRecordLoc.getY() < representativeLoc.getY()))) {
+                    // Mark the old min as an optical duplicate, and save the new min
+                    opticalDuplicateFlags[clusterToRepresentativeRead.get(recordAssignedCluster)] = true;
+                    clusterToRepresentativeRead.put(recordAssignedCluster, recordIndex);
+                } else {
+                    // If a smaller read has already been visited, mark the test read as an optical duplicate
+                    opticalDuplicateFlags[recordIndex] = true;
+                }
+            } else {
+                clusterToRepresentativeRead.put(recordAssignedCluster, recordIndex);
+            }
+        }
         return opticalDuplicateFlags;
     }
 
