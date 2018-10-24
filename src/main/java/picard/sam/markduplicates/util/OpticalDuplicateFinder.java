@@ -31,9 +31,7 @@ import picard.sam.util.ReadNameParser;
 import picard.util.GraphUtils;
 
 import java.io.Serializable;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Contains methods for finding optical/co-localized/sequencing duplicates.
@@ -41,7 +39,7 @@ import java.util.Map;
  * @author Tim Fennell
  * @author Nils Homer
  */
-public class OpticalDuplicateFinder extends ReadNameParser implements Serializable  {
+public class OpticalDuplicateFinder extends ReadNameParser implements Serializable {
 
     public int opticalDuplicatePixelDistance;
 
@@ -86,10 +84,9 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
     }
 
     /**
-     *
-     * @param readNameRegex see {@link ReadNameParser#DEFAULT_READ_NAME_REGEX}.
+     * @param readNameRegex                 see {@link ReadNameParser#DEFAULT_READ_NAME_REGEX}.
      * @param opticalDuplicatePixelDistance the optical duplicate pixel distance
-     * @param log the log to which to write messages.
+     * @param log                           the log to which to write messages.
      */
     public OpticalDuplicateFinder(final String readNameRegex, final int opticalDuplicatePixelDistance, final Log log) {
         super(readNameRegex, log);
@@ -97,17 +94,19 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
     }
 
     /**
-     *
-     * @param readNameRegex see {@link ReadNameParser#DEFAULT_READ_NAME_REGEX}.
+     * @param readNameRegex                 see {@link ReadNameParser#DEFAULT_READ_NAME_REGEX}.
      * @param opticalDuplicatePixelDistance the optical duplicate pixel distance
-     * @param maxDuplicateSetSize the size of a set that is too big enough to process
-     * @param log the log to which to write messages.
+     * @param maxDuplicateSetSize           the size of a set that is too big enough to process
+     * @param log                           the log to which to write messages.
      */
     public OpticalDuplicateFinder(final String readNameRegex, final int opticalDuplicatePixelDistance, final long maxDuplicateSetSize, final Log log) {
         super(readNameRegex, log);
         this.opticalDuplicatePixelDistance = opticalDuplicatePixelDistance;
         this.maxDuplicateSetSize = maxDuplicateSetSize;
     }
+
+
+    private transient Map<Integer, List<Integer>> tileRGmap = new HashMap<>();
 
     /**
      * Finds which reads within the list of duplicates that are likely to be optical/co-localized duplicates of
@@ -116,7 +115,7 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
      * optical duplicates are indicated by returning "true" at the same index in the resulting boolean[] as the
      * read appeared in the input list of physical locations.
      *
-     * @param list a list of reads that are determined to be duplicates of one another
+     * @param list   a list of reads that are determined to be duplicates of one another
      * @param keeper a single PhysicalLocation that is the one being kept as non-duplicate, and thus should never be
      *               annotated as an optical duplicate. May in some cases be null, or a PhysicalLocation not
      *               contained within the list!
@@ -159,27 +158,34 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
         if (logProgress) {
             log.debug("Building adjacency graph for duplicate group");
         }
+
         int keeperIndex = -1;
-        for (int i = 0; i < length; i++) {
-            final PhysicalLocation thisLoc = list.get(i);
-            if (keeper == thisLoc) {
+        for (int i = 0; i < list.size(); i++) {
+            PhysicalLocation currentLoc = list.get(i);
+            if (currentLoc == keeper) {
                 keeperIndex = i;
             }
-            for (int j = i + 1; j < length; j++) {
-                PhysicalLocation other = list.get(j);
-                // The main point of adding this log and if statement (also below) is a workaround a bug in the JVM
-                // which causes a deep exception (https://github.com/broadinstitute/picard/issues/472).
-                // It seems that this is related to https://bugs.openjdk.java.net/browse/JDK-8033717 which
-                // was closed due to non-reproducibility. We came across a bam file that evoked this error
-                // every time we tried to duplicate-mark it. The problem seemed to be a duplicate-set of size 500,000,
-                // and this loop seemed to kill the JVM for some reason. This logging statement (and the one in the
-                // loop below) solved the problem.
-                if (logProgress) progressLoggerForKeeper.record(String.format("%d", other.getReadGroup()), other.getX());
-                if (closeEnough(thisLoc, other, distance)) {
-                    opticalDistanceRelationGraph.addEdge(i, j);
+            if (currentLoc.hasLocation()) {
+                int key = ((int) currentLoc.getReadGroup() << 16) + currentLoc.getTile();
+
+                if (tileRGmap.containsKey(key)) {
+                    tileRGmap.get(key).add(i);
+                } else {
+                    List<Integer> plocation = new ArrayList<>();
+                    plocation.add(i);
+                    tileRGmap.put(key, plocation);
                 }
             }
+            opticalDistanceRelationGraph.addNode(i);
         }
+
+        // Since the Union-Join algorithm runs in O()
+        for (List<Integer> tileGroup : tileRGmap.values()) {
+            if (tileGroup.size() > 1) {
+                fillGraphFromAGroup(list, tileGroup, logProgress, progressLoggerForKeeper, distance, opticalDistanceRelationGraph);
+            }
+        }
+
         if (logProgress) {
             log.debug("Finished building adjacency graph for duplicate group, moving onto clustering");
         }
@@ -209,7 +215,7 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
                 final PhysicalLocation currentRecordLoc = list.get(recordIndex);
 
                 // If not in the keeper cluster, then keep the minX -> minY valued duplicate (note the tile must be equal for reads to cluster together)
-                if (!(keeperCluster != null && recordAssignedCluster == keeperCluster) && // checking we don't accidentally set the keeper as an optical duplicate
+                if (!(keeperIndex >= 0 && recordAssignedCluster == keeperCluster) && // checking we don't accidentally set the keeper as an optical duplicate
                         (currentRecordLoc.getX() < representativeLoc.getX() || (currentRecordLoc.getX() == representativeLoc.getX() && currentRecordLoc.getY() < representativeLoc.getY()))) {
                     // Mark the old min as an optical duplicate, and save the new min
                     opticalDuplicateFlags[clusterToRepresentativeRead.get(recordAssignedCluster)] = true;
@@ -222,7 +228,36 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
                 clusterToRepresentativeRead.put(recordAssignedCluster, recordIndex);
             }
         }
+
+        // Empty the map afterwards
+        tileRGmap.values().forEach(List::clear);
         return opticalDuplicateFlags;
+    }
+
+    private void fillGraphFromAGroup(final List<? extends PhysicalLocation> wholeList, final List<Integer> groupList, final boolean logProgress, final ProgressLogger progressLoggerForKeeper, final int distance, final GraphUtils.Graph<Integer> opticalDistanceRelationGraph) {
+
+        for (int i = 0; i < groupList.size(); i++) {
+            final int iIndex = groupList.get(i);
+            final PhysicalLocation currentLoc = wholeList.get(iIndex);
+            if (logProgress) {
+                progressLoggerForKeeper.record(String.format("%d", currentLoc.getReadGroup()), currentLoc.getX());
+            }
+
+            for (int j = i + 1; j < groupList.size(); j++) {
+                final int jIndex = groupList.get(j);
+                PhysicalLocation other = wholeList.get(jIndex);
+                // The main point of adding this log and if statement (also below) is a workaround a bug in the JVM
+                // which causes a deep exception (https://github.com/broadinstitute/picard/issues/472).
+                // It seems that this is related to https://bugs.openjdk.java.net/browse/JDK-8033717 which
+                // was closed due to non-reproducibility. We came across a bam file that evoked this error
+                // every time we tried to duplicate-mark it. The problem seemed to be a duplicate-set of size 500,000,
+                // and this loop seemed to kill the JVM for some reason. This logging statement (and the one in the
+                // loop below) solved the problem.
+                if (closeEnougnShort(currentLoc, other, distance)) {
+                    opticalDistanceRelationGraph.addEdge(iIndex, jIndex);
+                }
+            }
+        }
     }
 
     /** Returns the keeper if it is contained within the list and has location information, otherwise null. */
@@ -243,5 +278,11 @@ public class OpticalDuplicateFinder extends ReadNameParser implements Serializab
                lhs.getTile()      == rhs.getTile()      &&      // and the same tile
                Math.abs(lhs.getX() - rhs.getX()) <= distance &&
                Math.abs(lhs.getY() - rhs.getY()) <= distance;
+    }
+
+    private boolean closeEnougnShort(final PhysicalLocation lhs, final PhysicalLocation rhs, final int distance) {
+        return lhs != rhs &&
+                Math.abs(lhs.getX() - rhs.getX()) <= distance &&
+                Math.abs(lhs.getY() - rhs.getY()) <= distance;
     }
 }
